@@ -1,0 +1,466 @@
+#!/usr/bin/env python3
+
+from gi.repository import Gtk, GObject, Gio, Gdk
+import os
+import threading, queue
+import math
+import ctypes
+
+libc = ctypes.CDLL('libc.so.6')
+
+def prctl_set_name(name):
+	libc.prctl(15, name.encode('utf-8'))
+
+dab_channel_frequencies = {
+	 '5A': 174.928,
+	 '5B': 176.640,
+	 '5C': 178.352,
+	 '5D': 180.064,
+	 '6A': 181.936,
+	 '6B': 183.648,
+	 '6C': 185.360,
+	 '6D': 187.072,
+	 '7A': 188.928,
+	 '7B': 190.640,
+	 '7C': 192.352,
+	 '7D': 194.064,
+	 '8A': 195.936,
+	 '8B': 197.648,
+	 '8C': 199.360,
+	 '8D': 201.072,
+	 '9A': 202.928,
+	 '9B': 204.640,
+	 '9C': 206.352,
+	 '9D': 208.064,
+	'10A': 209.936,
+	'10N': 210.096,
+	'10B': 211.648,
+	'10C': 213.360,
+	'10D': 215.072,
+	'11A': 216.928,
+	'11N': 217.088,
+	'11B': 218.640,
+	'11C': 220.352,
+	'11D': 222.064,
+	'12A': 223.936,
+	'12N': 224.096,
+	'12B': 225.648,
+	'12C': 227.360,
+	'12D': 229.072
+}
+
+dab_programme_type = {
+	1: 'News',
+	2: 'Current Affairs',
+	3: 'Information',
+	4: 'Sport',
+	5: 'Education',
+	6: 'Drama',
+	7: 'Culture',
+	8: 'Science',
+	9: 'Varied',
+	10: 'Pop Music',
+	11: 'Rock Music',
+	12: 'Easy Listening',
+	13: 'Light Classical',
+	14: 'Serious Classical',
+	15: 'Other Music',
+	16: 'Weather/meteorology',
+	17: 'Finance/Business',
+	18: 'Children''s programmes',
+	19: 'Social Affairs',
+	20: 'Religion',
+	21: 'Phone In',
+	22: 'Travel',
+	23: 'Leisure',
+	24: 'Jazz Music',
+	25: 'Country Music',
+	26: 'National Music',
+	27: 'Oldies Music',
+	28: 'Folk Music',
+	29: 'Documentary',
+}
+
+class DABReceiver:
+
+	def __init__(self):
+		pass
+
+	def select_channel(self, ch):
+		pass
+
+	def get_frequency(self):
+		pass
+
+	def get_osc_correction(self):
+		pass
+
+	def calibrate(self):
+		pass
+
+	def start(self):
+		pass
+
+	def stop(self):
+		pass
+
+import dabdecoder_native
+from dabparser import *
+import dabplayer
+
+import iio
+
+class DABRadioPlayer:
+
+	def __init__(self):
+		self.fic_parser = DABFICParser()
+		self.audio_parser = DABPlusAudioParser()
+		self.db = DABDatabase()
+		self.db_lock = threading.RLock()
+
+		framefile_out, framefile_in = os.pipe()
+		self.framefile = os.fdopen(framefile_out, "rb")
+
+		rawfile_out, rawfile_in = os.pipe()
+		self.rawfile = os.fdopen(rawfile_in, "wb")
+
+		dabdecoder_native.init(rawfile_out, framefile_in)
+
+		self.player = dabplayer.DABAudioPlayer()
+
+		self.constellation = []
+		self.max_constellation = 0
+		self.fft = []
+
+		builder = Gtk.Builder()
+		builder.add_from_file('dab.glade')
+
+		builder.get_object('quit_button').connect('clicked', self.destroy)
+
+		self.ensemble_label = builder.get_object('ensemble_label')
+		self.time_label = builder.get_object('time_label')
+		self.constellation_drawingarea = builder.get_object('constellation_drawingarea')
+		self.fft_drawingarea = builder.get_object('fft_drawingarea')
+
+		self.constellation_drawingarea.connect('draw', self.draw_constellation)
+		self.fft_drawingarea.connect('draw', self.draw_fft)
+
+		self.service_information_label = builder.get_object('service_information_label')
+		self.service_list = builder.get_object('service_list')
+
+		service_view = builder.get_object('service_view')
+		service_view.get_selection().connect('changed', self.service_changed)
+		self.service_selection = service_view.get_selection()
+
+		service_view.connect('row-activated', self.service_row_activated)
+
+		self.play_button = builder.get_object('play_button')
+		self.stop_button = builder.get_object('stop_button')
+
+		self.play_button.connect('clicked', self.play_clicked)
+		self.stop_button.connect('clicked', self.stop_clicked)
+
+		builder.get_object('channel_combobox').connect('changed', self.channel_changed)
+		self.frequency_label = builder.get_object('frequency_label')
+
+		checkboxes = [('fft_checkbutton', dabdecoder_native.capture_fft),
+					  ('constellation_checkbutton', dabdecoder_native.capture_qpsk),
+					  ('track_frequency_checkbutton', dabdecoder_native.track_frequency)]
+
+		for x in checkboxes:
+			builder.get_object(x[0]).connect('toggled', self.checkbox_toggled, x[1])
+
+		window = builder.get_object('main_window')
+		window.connect('destroy', self.destroy)
+		window.show()
+
+		self.select_channel_queue = queue.Queue()
+
+
+		t = threading.Thread(target=self.receiver, name="DAB Parser")
+		t.daemon = True
+		t.start()
+
+		t = threading.Thread(target=self.decoder_process, name="DAB Decoder")
+		t.daemon = True
+		t.start()
+
+		t = threading.Thread(target=self.iio_thread, name="IIO Receiver")
+		t.daemon = True
+		t.start()
+
+	def update_frequency(self, val):
+		val /= 1000000.0
+		self.frequency_label.set_text('{:.3f}'.format(val))
+
+	def iio_thread(self):
+		prctl_set_name('DAB - IIO Receiver')
+		l = iio.scan_contexts()
+		name = list(l.keys())[0].decode("utf-8")
+		ctx = iio.Context(name)
+		self.iio_dev = ctx.find_device(b'cf-ad9361-lpc')
+		self.iio_dev.channels[0].enabled = True
+		self.iio_dev.channels[1].enabled = True
+
+		ad9361 = ctx.find_device(b'ad9361-phy')
+		ch = ad9361.channels[0]
+		attr = ch.attrs[b'frequency']
+		freq = int(attr.value)
+		GObject.idle_add(self.update_frequency, freq)
+
+		self.iio_buffer = iio.Buffer(self.iio_dev, 1024 * 100)
+
+		while True:
+			self.iio_buffer.refill()
+			data = self.iio_buffer.read()
+			self.rawfile.write(data)
+
+			freq = None
+			try:
+				freq = self.select_channel_queue.get(False)
+				freq *= 1000000
+			except:
+				pass
+
+			if freq is not None:
+				attr.value = '{:.0f}'.format(freq).encode('utf-8')
+				GObject.idle_add(self.update_frequency, freq)
+
+	def decoder_process(self):
+		prctl_set_name('DAB - Decoder')
+		while True:
+			ret = dabdecoder_native.process()
+			if ret <= 0:
+				break
+
+	def channel_changed(self, w):
+		self.stop_playback()
+		freq = dab_channel_frequencies[w.get_active_text()]
+		self.service_list.clear()
+		self.select_channel_queue.put(freq)
+
+	def destroy(self, *kwargs):
+		Gtk.main_quit()
+
+	def checkbox_toggled(self, w, fn):
+		fn(w.get_active())
+
+	def service_row_activated(self, w, path, column):
+		store = w.get_model()
+		it = store.get_iter(path)
+		if it:
+			self.start_playback(store, it)
+
+	def play_clicked(self, w):
+		store, it = self.service_selection.get_selected()
+		self.start_playback(store, it)
+
+	def stop_clicked(self, w):
+		self.stop_playback()
+
+	def start_playback(self, store, it):
+		with self.db_lock:
+			sc = store[it][1]
+
+			if not isinstance(sc, DABServiceComponentAudioStream):
+				return
+			subch = self.db.get_sub_channel(sc)
+			subch_start = subch.startaddr
+			subch_size = subch.size
+			subch_pl = subch.protection_level
+			subch_pl |= subch.option * 4
+
+		self.audio_parser.reset()
+		dabdecoder_native.set_subch_filter(subch_start, subch_size, subch_pl)
+		self.stop_button.set_sensitive(True)
+		self.player.start_playback()
+
+	def stop_playback(self):
+		dabdecoder_native.set_subch_filter(0, 0, 0)
+		self.stop_button.set_sensitive(False)
+		self.player.stop_playback()
+
+	def service_changed(self, selection):
+		store, it = selection.get_selected()
+		is_audio_service = False
+
+		if it is not None:
+			with self.db_lock:
+				sc = store[it][1]
+
+				pt = self.db.programme_type.get(sc.sid)
+				if pt is not None:
+					label = dab_programme_type.get(pt.code)
+					if label is not None:
+						pt = '{} ({})'.format(label, pt.code)
+					else:
+						pt = pt.code
+				else:
+					pt = 'N/A'
+
+				text = 'Service Organization ID: {}\n'.format(sc.sid)
+				text += 'Programme Type: {}\n'.format(pt)
+				text += 'Primary: {}\n'.format('Yes' if sc.primary else 'No')
+				text += 'Conditional Access: {}\n'.format('Yes' if sc.ca else 'No')
+
+				if isinstance(sc, DABServiceComponentAudioStream):
+					is_audio_service = True
+					text += 'Type: Audio\n'
+					text += 'ASCTty: {}\n'.format(sc.ascty)
+				else:
+					text += 'Type: Data\n'
+					text += 'Service Component ID: {}\n'.format(sc.scid)
+
+				subch = self.db.get_sub_channel(sc)
+				if subch is None:
+					text += 'Sub-channel: N/A\n'
+				else:
+					text += 'Sub-channel: {}\n'.format(subch.subchid)
+					text += '\tStart: {}\n'.format(subch.startaddr)
+					text += '\tSize: {}\n'.format(subch.size)
+
+					pl = '{}-{}'.format(subch.protection_level+1, 'A' if subch.option == 0 else 'B')
+					text += '\tProtection Level: {}\n'.format(pl)
+
+				self.service_information_label.set_text(text)
+
+		self.play_button.set_sensitive(is_audio_service)
+
+	def update_from_db(self):
+		with self.db_lock:
+			e = self.db.ensemble
+			if e is not None:
+				self.ensemble_label.set_text('{} ({})'.format(self.db.get_label(e), e.eid))
+
+			l = len(self.service_list)
+			j = 0
+			for i, so in enumerate(self.db.service_organizations.values()):
+				for sc in so.components:
+					label = self.db.get_label(sc) or '??? {}'.format(so.sid)
+					if isinstance(sc, DABServiceComponentAudioStream):
+						sc_type = 'Audio'
+					else:
+						sc_type = 'Data'
+					label = '{} ({})'.format(label.strip(), sc_type)
+					if j < l:
+						if self.service_list[j][0] != label:
+							self.service_list[j] = (label, sc)
+					else:
+						self.service_list.append((label, sc))
+					j += 1
+			if j < l:
+				for j in range(j, l):
+					del self.service_list[j]
+
+	def update_date_time(self, date_time):
+		self.time_label.set_text('{:02d}:{:02d}:{:02d}:{:03d}'.format(
+			date_time.hours, date_time.minutes, date_time.seconds,
+			date_time.milliseconds))
+
+	def receiver(self):
+		prctl_set_name('DAB - Parser')
+		while True:
+			header = self.framefile.read(8)
+			if len(header) == 0:
+				break
+			if header[0:3] != b'LPC':
+				print('Header signatur mismatch ({})'.format(header[0:3]), file=sys.stderr)
+				continue
+			packet_type, length, errors = struct.unpack_from('>BHH', header, 3)
+			data = self.framefile.read(length)
+			if packet_type == 0:
+				changed = False
+				with self.db_lock:
+					for x in self.fic_parser.handle_fic(data):
+						if isinstance(x, DABDateTime):
+							GObject.idle_add(self.update_date_time, x)
+						else:
+							changed |= self.db.update(x)
+				if changed:
+					GObject.idle_add(self.update_from_db)
+			elif packet_type == 1:
+				for x in self.audio_parser.handle_cif(data):
+					GObject.idle_add(self.player.push_frame, x)
+			elif packet_type == 2:
+#				self.constellation = []
+				for i in range(0, len(data), 16):
+					d = struct.unpack_from('@dd', data, i)
+					self.constellation.append(d)
+				GObject.idle_add(self.constellation_drawingarea.queue_draw)
+				self.constellation = self.constellation[-10000:]
+			elif packet_type == 3:
+				self.fft = []
+				for i in range(0, len(data), 16):
+					d = struct.unpack_from('@dd', data, i)
+					self.fft.append(d)
+				GObject.idle_add(self.fft_drawingarea.queue_draw)
+			else:
+				print('Unknown packet type: {}'.format(packet_type), file=sys.stderr)
+
+	def draw_constellation(self, w, cr):
+		a = w.get_allocation()
+		cr.set_source_rgba(1.0, 1.0, 1.0, 1.0)
+		cr.rectangle(0, 0, a.width, a.height)
+		cr.fill()
+
+		max_value = 0
+		for x in self.constellation:
+			max_value = max(max_value, abs(x[0]), abs(x[1]))
+		if max_value == 0:
+			return
+		if self.max_constellation == 0:
+			self.max_constellation = max_value
+		else:
+			self.max_constellation *= 0.9
+			self.max_constellation += max_value * 0.1
+		scale = 180 / self.max_constellation
+
+		cr.set_line_width(1)
+		cr.set_source_rgba(0.7, 0.7, 0.7, 1.0)
+		cr.translate(a.width / 2 + 0.0, a.height / 2 + 0.0)
+		cr.move_to(0.0, -a.height / 2)
+		cr.line_to(0.0, a.height / 2)
+		cr.move_to(-a.width / 2, 0.0)
+		cr.line_to(a.width / 2, 0.0)
+		cr.stroke()
+		cr.set_source_rgba(0.0, 0.0, 1.0, 0.8)
+#		cr.scale(scale, scale)
+		for x in self.constellation:
+			cr.move_to(x[0]*scale, x[1]*scale)
+			cr.line_to(x[0]*scale+1, x[1]*scale + 1)
+#			cr.close_path()
+		cr.stroke()
+
+	def draw_fft(self, w, cr):
+		a = w.get_allocation()
+		cr.set_source_rgba(1.0, 1.0, 1.0, 1.0)
+		cr.rectangle(0, 0, a.width, a.height)
+		cr.fill()
+
+		if len(self.fft) == 0:
+			return
+
+		mag = []
+		for x in self.fft:
+			m = x[0]**2 + x[1]**2
+			m /= 2048 * 2048
+			m = 10 * math.log(m) / math.log(10)
+			mag.append(m)
+
+		max_mag = max(mag)
+		min_mag = min(mag)
+		diff = max_mag - min_mag
+
+		mag = mag[1024:] + mag[:1024]
+
+		cr.set_line_width(0.5)
+		cr.set_source_rgba(0.0, 1.0, 0.0, 1.0)
+		cr.translate(0, 0)
+		xscale = a.width / 2048.0
+		for i, m in enumerate(mag):
+			cr.line_to(i*xscale, (40-m)*3.0)
+		cr.stroke()
+
+if __name__ == '__main__':
+	DABRadioPlayer()
+	Gtk.main()
